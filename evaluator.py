@@ -83,6 +83,88 @@ def evaluate(prompt: str, response: str, judge_model: str) -> dict:
     return ev
 
 
+_IMPROVE_PROMPT = """You are an expert prompt engineer. A user submitted a prompt to a chatbot and it was scored by an evaluator.
+
+ORIGINAL PROMPT:
+{prompt}
+
+CHATBOT RESPONSE:
+{response}
+
+SCORES (out of 10):
+  Relevance:    {relevance}
+  Accuracy:     {accuracy}
+  Completeness: {completeness}
+  Conciseness:  {conciseness}
+  Hallucination detected: {hallucination}
+  Overall quality: {quality}
+
+Analyse why the scores are what they are, then give 3 to 5 specific, actionable tips to improve the prompt so the chatbot produces a better response next time.
+
+Focus only on weaknesses (scores below 8). If a dimension scored 8 or above, skip it.
+Keep each tip concrete — bad: "be more specific", good: "add the target audience so the model knows the depth of explanation required".
+
+Also provide one rewritten version of the prompt that applies all your tips.
+
+Format your response exactly like this:
+
+TIPS:
+1. <tip>
+2. <tip>
+3. <tip>
+
+IMPROVED PROMPT:
+<rewritten prompt>"""
+
+
+def suggest_improvements(
+    prompt: str,
+    response: str,
+    evaluation: dict,
+    judge_model: str,
+) -> dict:
+    """Return improvement tips and a rewritten prompt.
+
+    Returns a dict with:
+        tips             list[str]  — actionable improvement tips
+        improved_prompt  str        — rewritten version of the prompt
+        raw              str        — full model output (for debugging)
+    """
+    coach_input = _IMPROVE_PROMPT.format(
+        prompt=prompt,
+        response=response,
+        relevance=evaluation.get("relevance", "?"),
+        accuracy=evaluation.get("accuracy", "?"),
+        completeness=evaluation.get("completeness", "?"),
+        conciseness=evaluation.get("conciseness", "?"),
+        hallucination="YES" if evaluation.get("hallucination_detected") else "No",
+        quality=evaluation.get("quality_score", "?"),
+    )
+
+    try:
+        result = generate(coach_input, judge_model)
+        raw = result["response"]
+    except Exception as exc:
+        return {"tips": [], "improved_prompt": "", "raw": str(exc)}
+
+    # Parse TIPS section
+    tips: list[str] = []
+    tips_match = re.search(r"TIPS:\s*\n(.*?)(?:\n\s*\n|IMPROVED PROMPT:)", raw, re.DOTALL)
+    if tips_match:
+        for line in tips_match.group(1).strip().splitlines():
+            line = re.sub(r"^\d+[\.\)]\s*", "", line.strip())
+            if line:
+                tips.append(line)
+
+    # Parse IMPROVED PROMPT section
+    improved = ""
+    improved_match = re.search(r"IMPROVED PROMPT:\s*\n(.*)", raw, re.DOTALL)
+    if improved_match:
+        improved = improved_match.group(1).strip()
+
+    return {"tips": tips, "improved_prompt": improved, "raw": raw}
+
+
 def _default_scores() -> dict:
     return {
         "relevance":             5.0,

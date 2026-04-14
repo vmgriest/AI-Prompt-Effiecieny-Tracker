@@ -231,7 +231,9 @@ tab_run, tab_ab, tab_dash, tab_hist = st.tabs(
 with tab_run:
     st.header("Run a prompt")
 
-    prompt_input = st.text_area("Prompt", height=120,
+    if "prefill_prompt" in st.session_state:
+        st.session_state["prompt_input_widget"] = st.session_state.pop("prefill_prompt")
+    prompt_input = st.text_area("Prompt", height=120, key="prompt_input_widget",
                                 placeholder="Enter your prompt here…")
 
     run_models = st.multiselect(
@@ -244,41 +246,80 @@ with tab_run:
         if not run_models:
             st.warning("Select at least one model.")
         else:
+            # Clear previous suggestions when a new run starts
+            for key in list(st.session_state.keys()):
+                if key.startswith("suggestions_"):
+                    del st.session_state[key]
+
             results = []
             for model in run_models:
                 r = _run_and_record(
                     prompt_input.strip(), model, judge_model, tags_input
                 )
                 results.append(r)
+            st.session_state["run_results"] = results
 
-            for r in results:
-                st.subheader(r["model"])
-                _metric_cards(r)
+    # Render results from session state so they survive button clicks
+    if "run_results" in st.session_state:
+        results = st.session_state["run_results"]
 
-                col_resp, col_radar = st.columns([2, 1])
-                with col_resp:
-                    st.markdown("**Response**")
-                    st.markdown(r["response"])
-                with col_radar:
-                    st.plotly_chart(
-                        _score_radar(r, r["model"]),
-                        width='stretch',
+        for r in results:
+            st.subheader(r["model"])
+            _metric_cards(r)
+
+            col_resp, col_radar = st.columns([2, 1])
+            with col_resp:
+                st.markdown("**Response**")
+                st.markdown(r["response"])
+            with col_radar:
+                st.plotly_chart(
+                    _score_radar(r, r["model"]),
+                    width='stretch',
+                )
+
+            # Improvement tips
+            improve_key = f"suggestions_{r['model'].replace(':','_')}"
+            if st.button("Get improvement tips", key=f"btn_{improve_key}"):
+                with st.spinner("Analysing prompt and generating tips…"):
+                    st.session_state[improve_key] = evaluator.suggest_improvements(
+                        prompt=r["prompt_text"],
+                        response=r["response"],
+                        evaluation=r,
+                        judge_model=judge_model,
                     )
-                st.divider()
 
-            if len(results) > 1:
-                st.subheader("Model comparison")
-                comp_df = pd.DataFrame([
-                    {
-                        "Model":      r["model"],
-                        "Quality":    r["quality_score"],
-                        "Tok/s":      r["tokens_per_second"],
-                        "Latency (s)": r["total_duration_ms"] / 1000,
-                        "Out tokens": r["output_tokens"],
-                    }
-                    for r in results
-                ])
-                st.dataframe(comp_df, width='stretch', hide_index=True)
+            if improve_key in st.session_state:
+                suggestions = st.session_state[improve_key]
+                if suggestions["tips"]:
+                    st.markdown("**Tips to improve your prompt:**")
+                    for i, tip in enumerate(suggestions["tips"], 1):
+                        st.markdown(f"{i}. {tip}")
+                else:
+                    st.info("No specific tips generated — try a different judge model.")
+
+                if suggestions["improved_prompt"]:
+                    st.markdown("**Suggested rewrite:**")
+                    st.info(suggestions["improved_prompt"])
+                    if st.button("Use this prompt", key=f"use_{improve_key}"):
+                        st.session_state["prefill_prompt"] = suggestions["improved_prompt"]
+                        del st.session_state["run_results"]
+                        st.rerun()
+
+            st.divider()
+
+        if len(results) > 1:
+            st.subheader("Model comparison")
+            comp_df = pd.DataFrame([
+                {
+                    "Model":       r["model"],
+                    "Quality":     r["quality_score"],
+                    "Tok/s":       r["tokens_per_second"],
+                    "Latency (s)": r["total_duration_ms"] / 1000,
+                    "Out tokens":  r["output_tokens"],
+                }
+                for r in results
+            ])
+            st.dataframe(comp_df, width='stretch', hide_index=True)
 
 
 # ─────────────────────────────────────────────
