@@ -25,9 +25,17 @@ def init_db():
             hallucination_detected INTEGER DEFAULT 0,
             judge_model           TEXT,
             tags                  TEXT,
-            timestamp             TEXT    NOT NULL
+            timestamp             TEXT    NOT NULL,
+            improvement_tips      TEXT,
+            improved_prompt       TEXT
         )
     """)
+    # Migrate existing DBs that predate these columns
+    for col in ("improvement_tips", "improved_prompt"):
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
+        except Exception:
+            pass  # column already exists
     conn.commit()
     conn.close()
 
@@ -42,14 +50,16 @@ def insert_run(data: dict) -> int:
             total_duration_ms, generation_duration_ms, tokens_per_second,
             quality_score, relevance_score, accuracy_score,
             completeness_score, conciseness_score, hallucination_detected,
-            judge_model, tags, timestamp
+            judge_model, tags, timestamp,
+            improvement_tips, improved_prompt
         ) VALUES (
             :prompt_text, :response_text, :model,
             :input_tokens, :output_tokens,
             :total_duration_ms, :generation_duration_ms, :tokens_per_second,
             :quality_score, :relevance_score, :accuracy_score,
             :completeness_score, :conciseness_score, :hallucination_detected,
-            :judge_model, :tags, :timestamp
+            :judge_model, :tags, :timestamp,
+            :improvement_tips, :improved_prompt
         )
     """, data)
     conn.commit()
@@ -77,6 +87,17 @@ def get_runs_by_prompt(prompt_text: str) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def update_run_tips(run_id: int, tips: list[str], improved_prompt: str):
+    """Persist improvement tips and the rewritten prompt for a run."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE runs SET improvement_tips = ?, improved_prompt = ? WHERE id = ?",
+        ("\n".join(tips), improved_prompt, run_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def delete_run(run_id: int):

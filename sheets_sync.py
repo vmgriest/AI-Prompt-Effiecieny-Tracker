@@ -89,6 +89,7 @@ def sync(runs: list[dict]) -> str:
         "total_duration_ms", "quality_score",
         "relevance_score", "accuracy_score", "completeness_score", "conciseness_score",
         "hallucination_detected", "judge_model", "tags",
+        "improvement_tips", "improved_prompt",
     ]
     df_prompts = df_all[[c for c in prompts_cols if c in df_all.columns]].copy()
     df_prompts.rename(columns={"total_duration_ms": "latency_ms"}, inplace=True)

@@ -101,12 +101,20 @@ def _models() -> list[str]:
 
 
 def _run_and_record(prompt: str, model: str, judge_model: str, tags: str = "") -> dict:
-    """Call Ollama, evaluate with judge, persist to DB.  Returns the full record."""
+    """Call Ollama, evaluate with judge, generate tips, persist to DB."""
     with st.spinner(f"Generating with **{model}**…"):
         gen = ollama_client.generate(prompt, model)
 
     with st.spinner(f"Evaluating with judge **{judge_model}**…"):
         ev = evaluator.evaluate(prompt, gen["response"], judge_model)
+
+    with st.spinner(f"Generating improvement tips…"):
+        suggestions = evaluator.suggest_improvements(
+            prompt=prompt,
+            response=gen["response"],
+            evaluation=ev,
+            judge_model=judge_model,
+        )
 
     record = {
         "prompt_text":             prompt,
@@ -126,15 +134,17 @@ def _run_and_record(prompt: str, model: str, judge_model: str, tags: str = "") -
         "judge_model":             judge_model,
         "tags":                    tags,
         "timestamp":               datetime.now().isoformat(timespec="seconds"),
+        "improvement_tips":        "\n".join(suggestions["tips"]),
+        "improved_prompt":         suggestions["improved_prompt"],
     }
-    db.insert_run(record)
+    run_id = db.insert_run(record)
 
     if sheets_sync.load_config().get("auto_sync"):
         with st.spinner("Syncing to Google Sheets…"):
             msg = sheets_sync.sync(db.get_all_runs())
         st.toast(msg)
 
-    return {**record, **gen, **ev}
+    return {**record, "id": run_id, **gen, **ev, **suggestions}
 
 
 def _metric_cards(result: dict):
@@ -277,33 +287,20 @@ with tab_run:
                     width='stretch',
                 )
 
-            # Improvement tips
-            improve_key = f"suggestions_{r['model'].replace(':','_')}"
-            if st.button("Get improvement tips", key=f"btn_{improve_key}"):
-                with st.spinner("Analysing prompt and generating tips…"):
-                    st.session_state[improve_key] = evaluator.suggest_improvements(
-                        prompt=r["prompt_text"],
-                        response=r["response"],
-                        evaluation=r,
-                        judge_model=judge_model,
-                    )
+            # Improvement tips — generated automatically during the run
+            if r.get("tips"):
+                st.markdown("**Tips to improve your prompt:**")
+                for i, tip in enumerate(r["tips"], 1):
+                    st.markdown(f"{i}. {tip}")
 
-            if improve_key in st.session_state:
-                suggestions = st.session_state[improve_key]
-                if suggestions["tips"]:
-                    st.markdown("**Tips to improve your prompt:**")
-                    for i, tip in enumerate(suggestions["tips"], 1):
-                        st.markdown(f"{i}. {tip}")
-                else:
-                    st.info("No specific tips generated — try a different judge model.")
-
-                if suggestions["improved_prompt"]:
-                    st.markdown("**Suggested rewrite:**")
-                    st.info(suggestions["improved_prompt"])
-                    if st.button("Use this prompt", key=f"use_{improve_key}"):
-                        st.session_state["prefill_prompt"] = suggestions["improved_prompt"]
-                        del st.session_state["run_results"]
-                        st.rerun()
+            if r.get("improved_prompt"):
+                st.markdown("**Suggested rewrite:**")
+                st.info(r["improved_prompt"])
+                use_key = f"use_{r['model'].replace(':','_')}"
+                if st.button("Use this prompt", key=use_key):
+                    st.session_state["prefill_prompt"] = r["improved_prompt"]
+                    del st.session_state["run_results"]
+                    st.rerun()
 
             st.divider()
 
@@ -369,13 +366,19 @@ with tab_ab:
             st.info("Tie — both prompts scored equally.")
 
 
+# Load runs here — AFTER tab_run and tab_ab button handlers have executed,
+# so any newly inserted runs are included in the count.
+all_runs = db.get_all_runs()
+
 # ─────────────────────────────────────────────
 # TAB 3 — DASHBOARD
 # ─────────────────────────────────────────────
 with tab_dash:
     st.header("Dashboard")
+    if st.button("Refresh", key="dash_refresh"):
+        st.rerun()
 
-    runs = db.get_all_runs()
+    runs = all_runs
     if not runs:
         st.info("No runs yet.  Go to **Run** to test your first prompt.")
     else:
@@ -480,7 +483,7 @@ with tab_dash:
 with tab_hist:
     st.header("Run history")
 
-    runs = db.get_all_runs()
+    runs = all_runs
     if not runs:
         st.info("No runs recorded yet.")
     else:
@@ -498,16 +501,17 @@ with tab_hist:
 
         if model_filter:
             df_hist = df_hist[df_hist["model"].isin(model_filter)]
-        df_hist = df_hist[df_hist["quality_score"] >= min_q]
+        df_hist = df_hist[df_hist["quality_score"].fillna(0) >= min_q]
 
         display_cols = [
             "id", "timestamp", "model", "prompt_text",
             "quality_score", "input_tokens", "output_tokens",
             "tokens_per_second", "total_duration_ms",
             "hallucination_detected", "judge_model", "tags",
+            "improvement_tips", "improved_prompt",
         ]
         st.dataframe(
-            df_hist[display_cols].rename(columns={
+            df_hist[[c for c in display_cols if c in df_hist.columns]].rename(columns={
                 "total_duration_ms": "latency_ms",
                 "hallucination_detected": "hallucination",
             }),
@@ -516,13 +520,25 @@ with tab_hist:
         )
 
         # Expand a single run
-        st.subheader("Inspect response")
+        st.subheader("Inspect run")
         run_ids = df_hist["id"].tolist()
         if run_ids:
             chosen_id = st.selectbox("Select run ID", run_ids)
             row = df_hist[df_hist["id"] == chosen_id].iloc[0]
             st.markdown(f"**Prompt:** {row['prompt_text']}")
             st.markdown(f"**Response:**\n\n{row['response_text']}")
+
+            tips_raw = row.get("improvement_tips", "") or ""
+            if tips_raw.strip():
+                st.markdown("**Improvement tips:**")
+                for i, tip in enumerate(tips_raw.strip().splitlines(), 1):
+                    if tip.strip():
+                        st.markdown(f"{i}. {tip.strip()}")
+
+            improved = row.get("improved_prompt", "") or ""
+            if improved.strip():
+                st.markdown("**Suggested rewrite:**")
+                st.info(improved)
 
             # Delete
             if st.button(f"Delete run #{chosen_id}", type="secondary"):
@@ -531,7 +547,6 @@ with tab_hist:
                 st.rerun()
 
         # Excel download + manual Google Sheets sync
-        all_runs = db.get_all_runs()
         if all_runs:
             dl_col, sync_col = st.columns([1, 1])
             with dl_col:
