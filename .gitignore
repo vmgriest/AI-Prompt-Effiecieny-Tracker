@@ -1,0 +1,17 @@
+# Credentials & secrets — never commit these
+credentials.json
+sheets_config.json
+
+# Local database
+tracker.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Virtual environments
+venv/
+.venv/
+env/

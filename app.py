@@ -7,6 +7,7 @@ Tabs:
   History   — full run log with delete
 """
 
+import io
 from datetime import datetime
 
 import pandas as pd
@@ -17,6 +18,7 @@ import streamlit as st
 import db
 import evaluator
 import ollama_client
+import sheets_sync
 
 # ── page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -26,6 +28,70 @@ st.set_page_config(
 )
 
 db.init_db()
+
+
+# ── Excel export ──────────────────────────────────────────────────────────────
+
+def _build_excel(runs: list[dict]) -> bytes:
+    """Return an Excel workbook as bytes with two sheets:
+
+    Prompts — one row per run, prompt-centric columns + all scores
+    Models  — one row per model, aggregated statistics
+    """
+    df_all = pd.DataFrame(runs)
+
+    # ── Prompts sheet ────────────────────────────────────────────────────────
+    prompts_cols = [
+        "id", "timestamp", "prompt_text", "response_text", "model",
+        "input_tokens", "output_tokens", "tokens_per_second",
+        "total_duration_ms", "quality_score",
+        "relevance_score", "accuracy_score", "completeness_score", "conciseness_score",
+        "hallucination_detected", "judge_model", "tags",
+    ]
+    df_prompts = df_all[[c for c in prompts_cols if c in df_all.columns]].copy()
+    df_prompts.rename(columns={"total_duration_ms": "latency_ms"}, inplace=True)
+
+    # ── Models sheet ─────────────────────────────────────────────────────────
+    agg = df_all.groupby("model").agg(
+        total_runs        =("id",                    "count"),
+        avg_quality       =("quality_score",         "mean"),
+        avg_relevance     =("relevance_score",        "mean"),
+        avg_accuracy      =("accuracy_score",         "mean"),
+        avg_completeness  =("completeness_score",     "mean"),
+        avg_conciseness   =("conciseness_score",      "mean"),
+        avg_tokens_per_sec=("tokens_per_second",      "mean"),
+        avg_latency_ms    =("total_duration_ms",      "mean"),
+        avg_input_tokens  =("input_tokens",           "mean"),
+        avg_output_tokens =("output_tokens",          "mean"),
+        hallucination_count=("hallucination_detected","sum"),
+    ).reset_index()
+    agg["hallucination_rate_%"] = (
+        agg["hallucination_count"] / agg["total_runs"] * 100
+    ).round(1)
+    for col in ["avg_quality","avg_relevance","avg_accuracy",
+                "avg_completeness","avg_conciseness",
+                "avg_tokens_per_sec","avg_latency_ms",
+                "avg_input_tokens","avg_output_tokens"]:
+        agg[col] = agg[col].round(2)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_prompts.to_excel(writer, sheet_name="Prompts", index=False)
+        agg.to_excel(writer, sheet_name="Models", index=False)
+
+        # Auto-fit column widths on both sheets
+        for sheet_name, df_sheet in [("Prompts", df_prompts), ("Models", agg)]:
+            ws = writer.sheets[sheet_name]
+            for col_idx, col_name in enumerate(df_sheet.columns, start=1):
+                max_len = max(
+                    len(str(col_name)),
+                    df_sheet[col_name].astype(str).str.len().max() if len(df_sheet) else 0,
+                )
+                ws.column_dimensions[
+                    ws.cell(row=1, column=col_idx).column_letter
+                ].width = min(max_len + 2, 60)
+
+    return buf.getvalue()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -62,6 +128,12 @@ def _run_and_record(prompt: str, model: str, judge_model: str, tags: str = "") -
         "timestamp":               datetime.now().isoformat(timespec="seconds"),
     }
     db.insert_run(record)
+
+    if sheets_sync.load_config().get("auto_sync"):
+        with st.spinner("Syncing to Google Sheets…"):
+            msg = sheets_sync.sync(db.get_all_runs())
+        st.toast(msg)
+
     return {**record, **gen, **ev}
 
 
@@ -122,6 +194,30 @@ with st.sidebar:
     st.caption("Optional tags (comma-separated)")
     tags_input = st.text_input("Tags", placeholder="experiment-1, zero-shot")
 
+    # ── Google Sheets config ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Google Sheets sync")
+
+    _gs_cfg = sheets_sync.load_config()
+
+    gs_id = st.text_input(
+        "Spreadsheet ID",
+        value=_gs_cfg.get("spreadsheet_id", ""),
+        placeholder="Paste the ID from your Sheet URL",
+        help="From https://docs.google.com/spreadsheets/d/<ID>/edit",
+    )
+    auto_sync = st.toggle("Auto-sync after every run", value=_gs_cfg.get("auto_sync", False))
+
+    if st.button("Save Sheets config"):
+        sheets_sync.save_config(gs_id.strip(), auto_sync)
+        st.success("Config saved.")
+
+    ok_sheets, sheets_msg = sheets_sync.is_configured()
+    if ok_sheets:
+        st.caption("credentials.json found")
+    else:
+        st.caption(f"⚠ {sheets_msg}")
+
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
@@ -166,7 +262,7 @@ with tab_run:
                 with col_radar:
                     st.plotly_chart(
                         _score_radar(r, r["model"]),
-                        use_container_width=True,
+                        width='stretch',
                     )
                 st.divider()
 
@@ -182,7 +278,7 @@ with tab_run:
                     }
                     for r in results
                 ])
-                st.dataframe(comp_df, use_container_width=True, hide_index=True)
+                st.dataframe(comp_df, width='stretch', hide_index=True)
 
 
 # ─────────────────────────────────────────────
@@ -218,7 +314,7 @@ with tab_ab:
                 st.metric("Out tokens", res["output_tokens"])
                 st.plotly_chart(
                     _score_radar(res, f"Prompt {label}"),
-                    use_container_width=True,
+                    width='stretch',
                 )
                 with st.expander("Response"):
                     st.markdown(res["response"])
@@ -276,7 +372,7 @@ with tab_dash:
                 markers=True,
                 range_y=[0, 10],
             )
-            st.plotly_chart(fig_time, use_container_width=True)
+            st.plotly_chart(fig_time, width='stretch')
 
         # Quality per model (box plot)
         with col2:
@@ -286,7 +382,7 @@ with tab_dash:
                 color="model",
                 range_y=[0, 10],
             )
-            st.plotly_chart(fig_box, use_container_width=True)
+            st.plotly_chart(fig_box, width='stretch')
 
         col3, col4 = st.columns(2)
 
@@ -303,7 +399,7 @@ with tab_dash:
                 labels={"total_duration_ms": "Latency (ms)", "quality_score": "Quality"},
                 range_y=[0, 10],
             )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width='stretch')
 
         # Tokens per second per model
         with col4:
@@ -313,7 +409,7 @@ with tab_dash:
                 title="Average generation speed (tok/s)",
                 color="model",
             )
-            st.plotly_chart(fig_tps, use_container_width=True)
+            st.plotly_chart(fig_tps, width='stretch')
 
         # Sub-score breakdown
         st.subheader("Score dimensions by model")
@@ -334,7 +430,7 @@ with tab_dash:
             title="Average sub-scores by model",
             range_y=[0, 10],
         )
-        st.plotly_chart(fig_dim, use_container_width=True)
+        st.plotly_chart(fig_dim, width='stretch')
 
 
 # ─────────────────────────────────────────────
@@ -374,7 +470,7 @@ with tab_hist:
                 "total_duration_ms": "latency_ms",
                 "hallucination_detected": "hallucination",
             }),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -393,11 +489,20 @@ with tab_hist:
                 st.success(f"Run #{chosen_id} deleted.")
                 st.rerun()
 
-        # CSV download
-        csv = df_hist[display_cols].to_csv(index=False)
-        st.download_button(
-            "Download CSV",
-            data=csv,
-            file_name="prompt_efficiency_runs.csv",
-            mime="text/csv",
-        )
+        # Excel download + manual Google Sheets sync
+        all_runs = db.get_all_runs()
+        if all_runs:
+            dl_col, sync_col = st.columns([1, 1])
+            with dl_col:
+                st.download_button(
+                    "Download Excel",
+                    data=_build_excel(all_runs),
+                    file_name="prompt_efficiency.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with sync_col:
+                ok_gs, _ = sheets_sync.is_configured()
+                if st.button("Sync to Google Sheets", disabled=not ok_gs):
+                    with st.spinner("Syncing…"):
+                        result_msg = sheets_sync.sync(all_runs)
+                    st.success(result_msg)
